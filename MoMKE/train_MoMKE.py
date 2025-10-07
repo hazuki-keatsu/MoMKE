@@ -14,6 +14,7 @@ import warnings
 sys.path.append('./')
 warnings.filterwarnings("ignore")
 import config
+from torch.utils.tensorboard import SummaryWriter
 
 
 def train_or_eval_model(args, model, reg_loss, cls_loss, dataloader, optimizer=None, train=False, first_stage=True, mark='train'):
@@ -131,6 +132,24 @@ def train_or_eval_model(args, model, reg_loss, cls_loss, dataloader, optimizer=N
             else:
                 loss = reg_loss(lp_, labels_, umask)
 
+        # Record batch loss into losses, used for the final calculation of avg_loss
+        # Currently, each loss is already "the average value per valid sample" (the number of valid masks has been divided out internally). 
+        # To preserve the original meaning of avg_loss = sum(losses) / sum(masks) — as dividing by the masks again would be incorrect — 
+        # we need to accumulate the "mean value multiplied by the number of valid samples in the current batch" as the unnormalized total.
+        with torch.no_grad():
+            batch_valid_count = umask.sum().item()
+            if batch_valid_count == 0:
+                batch_numerator = 0.0
+            else:
+                if first_stage:
+                    # Take the simple average of the average losses of each of the three modalities, 
+                    # then restore the total (alternatively, you can directly calculate (sum of the three losses / 3) * count).
+                    batch_avg_loss = (loss_a.item() + loss_t.item() + loss_v.item()) / 3.0
+                else:
+                    batch_avg_loss = loss.item()
+                batch_numerator = batch_avg_loss * batch_valid_count
+            losses.append(batch_numerator)
+
         ## save batch results
         preds_a.append(lp_a.data.cpu().numpy())
         preds_t.append(lp_t.data.cpu().numpy())
@@ -164,7 +183,7 @@ def train_or_eval_model(args, model, reg_loss, cls_loss, dataloader, optimizer=N
         preds_a = np.argmax(preds_a, 1)
         preds_t = np.argmax(preds_t, 1)
         preds_v = np.argmax(preds_v, 1)
-        avg_loss = round(np.sum(losses)/np.sum(masks), 4)
+        avg_loss = round(np.sum(losses)/np.sum(masks), 4) if len(losses) > 0 else 0.0
         avg_accuracy = accuracy_score(labels, preds, sample_weight=masks)
         avg_fscore = f1_score(labels, preds, sample_weight=masks, average='weighted')
         mae = 0
@@ -173,10 +192,9 @@ def train_or_eval_model(args, model, reg_loss, cls_loss, dataloader, optimizer=N
         avg_acc_t = accuracy_score(labels, preds_t, sample_weight=masks)
         avg_acc_v = accuracy_score(labels, preds_v, sample_weight=masks)
         return mae, ua, avg_accuracy, avg_fscore, [avg_acc_a, avg_acc_t, avg_acc_v], vidnames, avg_loss, weight
-
     elif dataset in ['CMUMOSI', 'CMUMOSEI']:
         non_zeros = np.array([i for i, e in enumerate(labels) if e != 0]) # remove 0, and remove mask
-        avg_loss = round(np.sum(losses)/np.sum(masks), 4)
+        avg_loss = round(np.sum(losses)/np.sum(masks), 4) if len(losses) > 0 else 0.0
         avg_accuracy = accuracy_score((labels[non_zeros] > 0), (preds[non_zeros] > 0))
         avg_fscore = f1_score((labels[non_zeros] > 0), (preds[non_zeros] > 0), average='weighted')
         mae = np.mean(np.absolute(labels[non_zeros] - preds[non_zeros].squeeze()))
@@ -229,6 +247,11 @@ if __name__ == '__main__':
     time_dataset = f"{datetime.datetime.now().strftime('%Y-%m-%d_%H_%M_%S')}_{args.dataset}"
     sys.stdout = Logger(filename=f"{save_log}/{time_dataset}_batchsize-{args.batch_size}_lr-{args.lr}_seed-{args.seed}_test-condition-{args.test_condition}.txt",
                         stream=sys.stdout)
+    # Create TensorBoard logs directory
+    tb_run_dir = os.path.join(save_log,'tensorboard' , f'{save_folder_name}',  f'{args.dataset}_batchsize-{args.batch_size}_lr{args.lr}_seed{args.seed}_test-condition-{args.test_condition}')
+    os.makedirs(tb_run_dir, exist_ok=True)
+    writer = SummaryWriter(log_dir=tb_run_dir)
+    print(f"TensorBoard 日志目录: {tb_run_dir}")
 
     ## seed
     def seed_torch(seed):
@@ -331,9 +354,29 @@ if __name__ == '__main__':
             if first_stage:
                 print(f'epoch:{epoch}; a_acc_train:{train_acc_atv[0]:.3f}; t_acc_train:{train_acc_atv[1]:.3f}; v_acc_train:{train_acc_atv[2]:.3f}')
                 print(f'epoch:{epoch}; a_acc_test:{train_acc_atv[0]:.3f}; t_acc_test:{train_acc_atv[1]:.3f}; v_acc_test:{train_acc_atv[2]:.3f}')
+                # TensorBoard Record
+                writer.add_scalar(f'fold{ii+1}/stage1/train_a_acc', train_acc_atv[0], epoch)
+                writer.add_scalar(f'fold{ii+1}/stage1/train_t_acc', train_acc_atv[1], epoch)
+                writer.add_scalar(f'fold{ii+1}/stage1/train_v_acc', train_acc_atv[2], epoch)
+                writer.add_scalar(f'fold{ii+1}/stage1/test_a_acc', test_acc_atv[0], epoch)
+                writer.add_scalar(f'fold{ii+1}/stage1/test_t_acc', test_acc_atv[1], epoch)
+                writer.add_scalar(f'fold{ii+1}/stage1/test_v_acc', test_acc_atv[2], epoch)
             else:
                 print(f'epoch:{epoch}; train_mae_{args.test_condition}:{train_mae:.3f}; train_corr_{args.test_condition}:{train_corr:.3f}; train_fscore_{args.test_condition}:{train_fscore:2.2%}; train_acc_{args.test_condition}:{train_acc:2.2%}; train_loss_{args.test_condition}:{train_loss}')
                 print(f'epoch:{epoch}; test_mae_{args.test_condition}:{test_mae:.3f}; test_corr_{args.test_condition}:{test_corr:.3f}; test_fscore_{args.test_condition}:{test_fscore:2.2%}; test_acc_{args.test_condition}:{test_acc:2.2%}; test_loss_{args.test_condition}:{test_loss}')
+                # TensorBoard Record
+                writer.add_scalar(f'fold{ii+1}/stage2/train_mae_{args.test_condition}', train_mae, epoch)
+                writer.add_scalar(f'fold{ii+1}/stage2/test_mae_{args.test_condition}', test_mae, epoch)
+                writer.add_scalar(f'fold{ii+1}/stage2/train_corr_{args.test_condition}', train_corr, epoch)
+                writer.add_scalar(f'fold{ii+1}/stage2/test_corr_{args.test_condition}', test_corr, epoch)
+                writer.add_scalar(f'fold{ii+1}/stage2/train_fscore_{args.test_condition}', train_fscore, epoch)
+                writer.add_scalar(f'fold{ii+1}/stage2/test_fscore_{args.test_condition}', test_fscore, epoch)
+                writer.add_scalar(f'fold{ii+1}/stage2/train_acc_{args.test_condition}', train_acc, epoch)
+                writer.add_scalar(f'fold{ii+1}/stage2/test_acc_{args.test_condition}', test_acc, epoch)
+                if train_loss is not None:
+                    writer.add_scalar(f'fold{ii+1}/stage2/train_loss_{args.test_condition}', train_loss, epoch)
+                if test_loss is not None:
+                    writer.add_scalar(f'fold{ii+1}/stage2/test_loss_{args.test_condition}', test_loss, epoch)
             print('-'*10)
             ## update the parameter for the 2nd stage
             if epoch == args.stage_epoch-1:
@@ -419,3 +462,8 @@ if __name__ == '__main__':
     save_path = f'{save_model}/{suffix_name}_features-{feature_name}_{res_name}_test-condition-{args.test_condition}.pth'
     torch.save({'model': model.state_dict()}, save_path)
     print(save_path)
+    # Close TensorBoard
+    try:
+        writer.close()
+    except Exception as e:
+        print(f"关闭 TensorBoard 失败: {e}")
